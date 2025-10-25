@@ -9,6 +9,7 @@ import { fetchAffiliate, fetchAffiliateRaw } from './src/affiliates.js';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 const UPLOAD_DIR = path.resolve('uploads');
@@ -78,12 +79,16 @@ app.get('/api/prizes', (req, res) => res.json({ prizes }));
 app.get('/api/hero', (req, res) => res.json(hero));
 
 function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN)
-    return res.status(500).json({ error: 'ADMIN_TOKEN missing' });
-  if (req.get('x-admin-token') !== ADMIN_TOKEN)
-    return res.status(401).json({ error: 'unauthorized' });
+  const token = req.get('x-admin-token');
+  if (!process.env.ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
+  if (token !== process.env.ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
   next();
 }
+const adminLimiter = rateLimit({ windowMs: 60_000, max: 20 });
+
+app.get('/api/admin/ping', adminLimiter, requireAdmin, (req, res) => {
+  res.json({ ok: true });
+});
 
 app.post('/api/prizes', requireAdmin, (req, res) => {
   const arr = req.body?.prizes;
@@ -288,7 +293,7 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       `name: ${r.name} | id: ${r.id} | uuid: ${r.uuid} | 64id: ${r.steam64}`
     );
     const text = lines.join('\n');
-
+    
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="tokyorewards-ids_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.txt"`);
     res.send(text);
