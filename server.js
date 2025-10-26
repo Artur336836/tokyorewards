@@ -18,6 +18,37 @@ const UPLOAD_DIR = path.resolve('uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 app.use('/uploads', express.static(UPLOAD_DIR));
 const upload = multer({ dest: path.join(UPLOAD_DIR, 'tmp') });
+const SETTINGS_PATH = path.join(UPLOAD_DIR, 'settings.json');
+
+function saveSettings() {
+  try {
+    const data = { hero, countdownEnd };
+    const tmp = SETTINGS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+    fs.renameSync(tmp, SETTINGS_PATH);
+  } catch (e) {
+    console.warn('[settings] save failed:', e?.message || e);
+  }
+}
+
+function loadSettings() {
+  try {
+    if (!fs.existsSync(SETTINGS_PATH)) return;
+    const raw = fs.readFileSync(SETTINGS_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.countdownEnd) countdownEnd = parsed.countdownEnd;
+      if (parsed.hero && typeof parsed.hero === 'object') {
+        hero = { ...hero, ...parsed.hero }; // merge, keep fields you added later
+      }
+    }
+    console.log('[settings] loaded from disk');
+  } catch (e) {
+    console.warn('[settings] load failed:', e?.message || e);
+  }
+}
+loadSettings();
+
 
 // ---------- HTTP + Socket ----------
 const server = http.createServer(app);
@@ -276,8 +307,10 @@ app.post('/api/countdown', requireAdmin, (req, res) => {
   if (!Number.isFinite(dt)) return res.status(400).json({ error: 'invalid end' });
 
   countdownEnd = new Date(dt).toISOString();
+  saveSettings();                         // <— add this
   io.emit('countdown:update', { end: countdownEnd });
   res.json({ end: countdownEnd });
+
 });
 
 // hero main image upload
@@ -287,6 +320,7 @@ app.post('/api/hero/image', requireAdmin, upload.single('image'), (req, res) => 
   fs.renameSync(req.file.path, finalPath);
   const publicUrl = '/uploads/' + path.basename(finalPath);
   hero.imageUrl = publicUrl;
+  saveSettings();
   io.emit('hero:update', hero);
   res.json({ imageUrl: publicUrl });
 });
@@ -298,6 +332,7 @@ app.post('/api/hero/coin-image', requireAdmin, upload.single('image'), (req, res
   fs.renameSync(req.file.path, finalPath);
   const publicUrl = '/uploads/' + path.basename(finalPath);
   hero.coinImageUrl = publicUrl;
+  saveSettings();
   io.emit('hero:update', hero);
   res.json({ coinImageUrl: publicUrl });
 });
@@ -327,7 +362,7 @@ app.post('/api/hero', requireAdmin, (req, res) => {
     imageGlow: imageGlow ?? hero.imageGlow,
     coinImageUrl: coinImageUrl ?? hero.coinImageUrl,
   };
-
+  saveSettings();
   io.emit('hero:update', hero);
   res.json(hero);
 });
