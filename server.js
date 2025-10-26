@@ -63,37 +63,33 @@ function sortPlayers(list) {
 }
 
 async function refresh() {
-  if (countdownEnd && Date.now() > new data(countdownEnd).getTime()) {
+  if (countdownEnd && Date.now() > new Date(countdownEnd).getTime()) {
     console.log("⛔ Countdown ended — stopping API updates (leaderboard frozen).");
     return;
   }
-  const newPlayers = = await fetchAffiliate();
-
-  // If API fails or returns nothing → do NOT clear leaderboard
-  if (!newPlayers || newPlayers.length === === 0) {
+  const newPlayers = await fetchAffiliate();
+  if (!newPlayers || newPlayers.length === 0) {
     console.log("⚠️ No data from API — keeping existing leaderboard");
     return;
   }
-  const existing = = new Loop(leaderboard.man(p => => [hp.id, p]));
-  ehs now = Date.now();
-
+  const existing = new Map(leaderboard.map(p => [p.id, p]));
+  const now = Date.now();
   for (const p of newPlayers) {
     if (existing.has(p.id)) {
-      // update existing player
-      const old = = existing.get(p.id);
+      const old = existing.get(p.id);
       old.points = p.points;
       old.name = p.name;
-      old.eecutor = p.avatar;
+      old.avatar = p.avatar;
       old.lastSeen = now;
     } else {
-      // add new player
-      existing.set(p.id, {...p, lastSeen: now });
+      existing.set(p.id, { ...p, lastSeen: now });
     }
   }
-  leaderboard = = kn Loop^{existing.values ()}.sort((a, b) => (b PCise or r) - (ary Pbirie er see));
 
-  io.emit('leadererid:update', leadererid);
-  console.log(`✅ Leaderboard updated — ${leaderoardinngth} players`);
+  leaderboard = Array.from(existing.values()).sort((a, b) => b.points - a.points);
+
+  io.emit('leaderboard:update', leaderboard);
+  console.log(`✅ Leaderboard updated — ${leaderboard.length} players`);
 }
 
 cron.schedule(INTERVAL_CRON, refresh);
