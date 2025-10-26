@@ -12,28 +12,67 @@ import fs from 'fs';
 import rateLimit from 'express-rate-limit';
 
 const app = express();
+
+// ---------- FS setup ----------
 const UPLOAD_DIR = path.resolve('uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-
 app.use('/uploads', express.static(UPLOAD_DIR));
-
 const upload = multer({ dest: path.join(UPLOAD_DIR, 'tmp') });
 
+// ---------- HTTP + Socket ----------
 const server = http.createServer(app);
-const io = new IOServer(server, {
-  cors: { origin: process.env.FRONTEND_ORIGIN || true }
-});
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
+const io = new IOServer(server, { cors: { origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN } });
 
 const PORT = process.env.PORT || 8080;
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const INTERVAL_CRON = process.env.AFFILIATE_CRON || '*/30 * * * *'; // default: every 30 min
 
-const INTERVAL_CRON = process.env.AFFILIATE_CRON || '*/30 * * * *';
-
+// ---------- State ----------
 let leaderboard = [];
 let updatedAt = null;
 
+// date-windowed leaderboard controls
+let contestStart = null; // ISO string or null
+let contestEnd   = null; // ISO string or null
+
+// cache + history paths
 const CACHE_PATH = path.join(UPLOAD_DIR, 'leaderboard.json');
+const HIST_PATH  = path.join(UPLOAD_DIR, 'leaderboard-history.ndjson');
+
+// misc content
+let prizes = [175, 100, 70, 50, 35, 25, 15, 10, 10, 10];
+let countdownEnd = process.env.COUNTDOWN_END ? new Date(process.env.COUNTDOWN_END).toISOString() : null;
+let announcement = process.env.ANNOUNCEMENT || '';
+let hero = {
+  headline: '$ 500 CSGOWIN WAGER LEADERBOARD',
+  sub1: 'Top 10 players with the highest wagers past 2 weeks win a share of $500',
+  sub2: 'The leaderboard updates every 30 minutes.',
+  linkText: undefined,
+  linkUrl: undefined,
+  headlineColor: '#ffffff',
+  sub1Color: '#cbd5e1',
+  sub2Color: '#cbd5e1',
+  headlineGlow: '0 0 12px rgba(255,255,255,0.8)',
+  imageUrl: '/site-logo.png',
+  imageGlow: 'drop-shadow(0 0 16px rgba(255,255,255,0.65))',
+  coinImageUrl: undefined, // NEW
+};
+
+// ---------- Middlewares ----------
+app.use(express.json());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN }));
+
+// ---------- Helpers ----------
+function sortPlayers(list) {
+  return (Array.isArray(list) ? list : [])
+    .map(x => ({ ...x, points: Number(x?.points) || 0 }))
+    .sort((a, b) => b.points - a.points);
+}
+function isSane(list) {
+  return Array.isArray(list) && list.length > 0;
+}
 
 function saveCache() {
   try {
@@ -44,7 +83,6 @@ function saveCache() {
     console.warn('[cache] save failed:', e?.message || e);
   }
 }
-
 function loadCacheIfAny() {
   try {
     if (!fs.existsSync(CACHE_PATH)) return;
@@ -61,55 +99,81 @@ function loadCacheIfAny() {
 }
 loadCacheIfAny();
 
-
-let prizes = [175, 100, 70, 50, 35, 25, 15, 10, 10, 10];
-let countdownEnd = process.env.COUNTDOWN_END
-  ? new Date(process.env.COUNTDOWN_END).toISOString()
-  : null;
-let announcement = process.env.ANNOUNCEMENT || '';
-
-let hero = {
-  headline: '$ 500 CSGOWIN WAGER LEADERBOARD',
-  sub1: 'Top 10 players with the highest wagers past 2 weeks win a share of $500',
-
-  sub2: 'The leaderboard updates every 30 minutes.',
-  linkText: undefined,
-  linkUrl: undefined,
-  headlineColor: '#ffffff',
-  sub1Color: '#cbd5e1',
-  sub2Color: '#cbd5e1',
-  headlineGlow: '0 0 12px rgba(255,255,255,0.8)',
-  imageUrl: '/site-logo.png',
-  imageScale: 1.0,
-  imageGlow: 'drop-shadow(0 0 16px rgba(255,255,255,0.65))'
-};
-
-app.use(express.json());
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-}));
-app.use(
-  cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN })
-);
-
-function sortPlayers(list) {
-  return (Array.isArray(list) ? list : [])
-    .map(x => ({ ...x, points: Number(x?.points) || 0 }))
-    .sort((a, b) => b.points - a.points);
-}
-function isSane(list) {
-  return Array.isArray(list) && list.length > 0;
+function appendHistorySnapshot(list) {
+  try {
+    const row = {
+      ts: Date.now(),
+      p: Object.fromEntries((list || []).map(u => [String(u.id), Number(u.points || 0)]))
+    };
+    fs.appendFileSync(HIST_PATH, JSON.stringify(row) + '\n', 'utf8');
+  } catch (e) {
+    console.warn('[history] append failed:', e?.message || e);
+  }
 }
 
+function readHistory() {
+  const out = [];
+  try {
+    if (!fs.existsSync(HIST_PATH)) return out;
+    const lines = fs.readFileSync(HIST_PATH, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) { try { out.push(JSON.parse(line)); } catch {} }
+  } catch {}
+  return out.sort((a, b) => a.ts - b.ts);
+}
+
+// windowed points = max(points) in [start,end] - last points before start
+function computeWindowed(startMs, endMs) {
+  const hist = readHistory();
+  if (!hist.length) return [];
+
+  const before = new Map();   // id -> last value before start
+  const inwin  = new Map();   // id -> max value during window
+
+  for (const snap of hist) {
+    const t = snap.ts, P = snap.p || {};
+    if (t < startMs) {
+      for (const [id, pts] of Object.entries(P)) before.set(id, pts);
+    } else if (t <= endMs) {
+      for (const [id, pts] of Object.entries(P)) {
+        const cur = inwin.get(id);
+        if (cur == null || pts > cur) inwin.set(id, pts);
+      }
+    }
+  }
+
+  const results = [];
+  const ids = new Set([...before.keys(), ...inwin.keys()]);
+  for (const id of ids) {
+    const baseline = before.get(id) ?? 0;
+    const peak = inwin.get(id);
+    if (peak == null) continue;
+    const gain = Math.max(0, peak - baseline);
+    if (gain > 0) {
+      const cur = (leaderboard || []).find(u => String(u.id) === id);
+      results.push({ id, name: cur?.name ?? 'Player', avatar: cur?.avatar ?? null, points: gain });
+    }
+  }
+  results.sort((a, b) => b.points - a.points);
+  return results;
+}
+
+// ---------- Refresh loop ----------
 async function refresh() {
+  // Optionally freeze further updates after countdown end
+  if (countdownEnd && Date.now() > new Date(countdownEnd).getTime()) {
+    console.log('⛔ Countdown ended — stopping API updates (leaderboard frozen).');
+    return;
+  }
+
   try {
     const players = await fetchAffiliate();
-    const sorted = sortPlayers(players);
+    const sorted  = sortPlayers(players);
 
     if (isSane(sorted)) {
       leaderboard = sorted;
-      updatedAt = new Date().toISOString();
+      updatedAt   = new Date().toISOString();
       saveCache();
+      appendHistorySnapshot(leaderboard); // snapshot for window math
       io.emit('leaderboard:update', leaderboard);
       console.log(`[refresh] ok: ${leaderboard.length} players at ${updatedAt}`);
     } else {
@@ -117,45 +181,65 @@ async function refresh() {
     }
   } catch (err) {
     console.error('[refresh] failed:', err?.message || err);
-  
+    // keep last good cache
   }
 }
-
 cron.schedule(INTERVAL_CRON, refresh);
-
 setTimeout(() => { refresh().catch(()=>{}); }, 1500);
 
+// ---------- Health ----------
 app.get('/healthz', (req, res) => {
-  res.json({
-    ok: true,
-    updatedAt,
-    count: leaderboard.length
-  });
+  res.json({ ok: true, updatedAt, count: leaderboard.length });
 });
 
-app.get('/api/leaderboard', (req, res) => res.json(leaderboard));
+// ---------- Public API ----------
+app.get('/api/leaderboard', (req, res) => {
+  if (contestStart && contestEnd) {
+    const s = Date.parse(contestStart), e = Date.parse(contestEnd);
+    if (Number.isFinite(s) && Number.isFinite(e) && e >= s) {
+      return res.json(computeWindowed(s, e));
+    }
+  }
+  res.json(leaderboard);
+});
+
+app.get('/api/leaderboard/meta', (req, res) => {
+  res.json({ updatedAt, count: leaderboard.length });
+});
+
+// Optional ad-hoc preview of any range
+app.get('/api/leaderboard/range', (req, res) => {
+  const s = Date.parse(req.query.start ?? ''), e = Date.parse(req.query.end ?? '');
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e < s) {
+    return res.status(400).json({ error: 'invalid range' });
+  }
+  res.json(computeWindowed(s, e));
+});
+
 app.get('/api/countdown', (req, res) => res.json({ end: countdownEnd }));
 app.get('/api/announcement', (req, res) => res.json({ announcement }));
 app.get('/api/prizes', (req, res) => res.json({ prizes }));
 app.get('/api/hero', (req, res) => res.json(hero));
 
-// Optional: metadata endpoint if you want it in the frontend later
-app.get('/api/leaderboard/meta', (req, res) => {
-  res.json({ updatedAt, count: leaderboard.length });
-});
-
-// ------------------ Admin helpers ------------------
+// ---------- Contest window (Admin) ----------
 function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
   const token = req.get('x-admin-token');
-  if (!process.env.ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
-  if (token !== process.env.ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
+  if (token !== ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
   next();
 }
 const adminLimiter = rateLimit({ windowMs: 60_000, max: 20 });
 
-app.get('/api/admin/ping', adminLimiter, requireAdmin, (req, res) => {
-  res.json({ ok: true });
+app.get('/api/contest', (req, res) => res.json({ start: contestStart, end: contestEnd }));
+app.post('/api/contest', requireAdmin, (req, res) => {
+  const { start, end } = req.body || {};
+  contestStart = start ? new Date(start).toISOString() : null;
+  contestEnd   = end   ? new Date(end).toISOString()   : null;
+  res.json({ start: contestStart, end: contestEnd });
 });
+
+// ---------- Admin helpers ----------
+app.get('/api/admin/ping', adminLimiter, requireAdmin, (req, res) => res.json({ ok: true }));
 
 app.post('/api/prizes', requireAdmin, (req, res) => {
   const arr = req.body?.prizes;
@@ -172,7 +256,6 @@ app.post('/api/countdown', requireAdmin, (req, res) => {
   if (typeof t === 'string' && /^\d+$/.test(t)) t = Number(t);
   if (typeof t === 'number') t = new Date(t);
   if (typeof t === 'string') {
-    // allow "YYYY-MM-DD HH:mm:ss" without timezone
     const raw = t.trim();
     if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
       t = new Date(raw.replace(' ', 'T'));
@@ -186,36 +269,40 @@ app.post('/api/countdown', requireAdmin, (req, res) => {
   res.json({ end: countdownEnd });
 });
 
+// hero main image upload
 app.post('/api/hero/image', requireAdmin, upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'no file' });
-
   const finalPath = path.join(UPLOAD_DIR, 'hero' + path.extname(req.file.originalname || '.png'));
   fs.renameSync(req.file.path, finalPath);
-
-  // public URL
   const publicUrl = '/uploads/' + path.basename(finalPath);
   hero.imageUrl = publicUrl;
   io.emit('hero:update', hero);
-
   res.json({ imageUrl: publicUrl });
 });
 
-app.post('/api/announcement', requireAdmin, (req, res) => {
-  announcement = req.body?.announcement || '';
-  io.emit('announcement:update', { announcement });
-  res.json({ announcement });
+// NEW: coin image upload
+app.post('/api/hero/coin-image', requireAdmin, upload.single('image'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'no file' });
+  const finalPath = path.join(UPLOAD_DIR, 'coin' + path.extname(req.file.originalname || '.png'));
+  fs.renameSync(req.file.path, finalPath);
+  const publicUrl = '/uploads/' + path.basename(finalPath);
+  hero.coinImageUrl = publicUrl;
+  io.emit('hero:update', hero);
+  res.json({ coinImageUrl: publicUrl });
 });
 
+// hero settings
 app.post('/api/hero', requireAdmin, (req, res) => {
   const {
     headline, sub1, sub2,
     linkText, linkUrl,
     headlineColor, sub1Color, sub2Color,
-    headlineGlow, imageUrl, imageGlow, 
-    imageScale
+    headlineGlow, imageUrl, imageGlow,
+    coinImageUrl, // NEW
   } = req.body || {};
 
   hero = {
+    ...hero,
     headline: headline ?? hero.headline,
     sub1: sub1 ?? hero.sub1,
     sub2: sub2 ?? hero.sub2,
@@ -227,11 +314,17 @@ app.post('/api/hero', requireAdmin, (req, res) => {
     headlineGlow: headlineGlow ?? hero.headlineGlow,
     imageUrl: imageUrl ?? hero.imageUrl,
     imageGlow: imageGlow ?? hero.imageGlow,
-    imageScale: typeof imageScale === 'number' ? imageScale : hero.imageScale,
+    coinImageUrl: coinImageUrl ?? hero.coinImageUrl,
   };
 
   io.emit('hero:update', hero);
   res.json(hero);
+});
+
+app.post('/api/announcement', requireAdmin, (req, res) => {
+  announcement = req.body?.announcement || '';
+  io.emit('announcement:update', { announcement });
+  res.json({ announcement });
 });
 
 app.post('/api/admin/refresh', requireAdmin, async (req, res) => {
@@ -239,7 +332,7 @@ app.post('/api/admin/refresh', requireAdmin, async (req, res) => {
   res.json({ ok: true, count: leaderboard.length, updatedAt });
 });
 
-// -------- IDs export helper (unchanged except filename fix) --------
+// IDs export
 app.get('/api/ids', requireAdmin, async (req, res) => {
   try {
     const raw = await fetchAffiliateRaw();
@@ -249,12 +342,8 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       for (const p of paths) {
         let cur = obj;
         for (const seg of String(p).split('.')) {
-          if (cur && Object.prototype.hasOwnProperty.call(cur, seg)) {
-            cur = cur[seg];
-          } else {
-            cur = undefined;
-            break;
-          }
+          if (cur && Object.prototype.hasOwnProperty.call(cur, seg)) cur = cur[seg];
+          else { cur = undefined; break; }
         }
         if (cur != null) return cur;
       }
@@ -266,10 +355,7 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       if (steam64 != null) {
         const s = String(steam64).trim();
         if (/^\d{17}$/.test(s)) return s;
-        try {
-          const n = BigInt(s);
-          if (n >= BASE64) return n.toString();
-        } catch {}
+        try { const n = BigInt(s); if (n >= BASE64) return n.toString(); } catch {}
       }
       if (steam2) {
         const s = String(steam2).trim();
@@ -277,7 +363,6 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
         if (m) {
           const acct = BigInt(m[2]);
           const universe = BigInt(m[1]);
-          // universe is not needed for accountId → 64 conversion here
           return (BASE64 + acct * 2n + (universe === 1n ? 1n : 0n)).toString();
         }
       }
@@ -290,25 +375,20 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
         }
       }
       if (accountId != null && String(accountId).trim() !== '') {
-        try {
-          const a = BigInt(String(accountId).trim());
-          return (BASE64 + a).toString();
-        } catch {}
+        try { const a = BigInt(String(accountId).trim()); return (BASE64 + a).toString(); } catch {}
       }
       return '';
     }
 
     const mapped = list.map((u, i) => {
       const name = pick(
-        u,
-        'name','username','displayName',
+        u, 'name','username','displayName',
         'user.name','user.username','user.displayName',
         'profile.name','profile.username','profile.displayName'
       ) ?? `Player ${i + 1}`;
 
       const id = pick(
-        u,
-        'id','uuid','user_id','userId','userID','user','account_id',
+        u, 'id','uuid','user_id','userId','userID','user','account_id',
         'user.id','user.uuid','profile.id','profile.uuid'
       );
       const uuid = pick(u, 'uuid','user_uuid','user.uuid','profile.uuid');
@@ -360,9 +440,7 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       seen.add(k);
       unique.push(r);
     }
-    const lines = unique.map(r =>
-      `name: ${r.name} | id: ${r.id} | uuid: ${r.uuid} | 64id: ${r.steam64}`
-    );
+    const lines = unique.map(r => `name: ${r.name} | id: ${r.id} | uuid: ${r.uuid} | 64id: ${r.steam64}`);
     const text = lines.join('\n');
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
