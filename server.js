@@ -79,14 +79,14 @@ let hero = {
   headline: '$ 500 CSGOWIN WAGER LEADERBOARD',
   sub1: 'Top 10 players with the highest wagers past 2 weeks win a share of $500',
   sub2: 'The leaderboard updates every 30 minutes.',
-  linkText: undefined,
-  linkUrl: undefined,
+  linkText: process.env.HERO_LINK_TEXT || '',
+  linkUrl: process.env.HERO_LINK_URL || '',
   headlineColor: '#ffffff',
   sub1Color: '#cbd5e1',
   sub2Color: '#cbd5e1',
   headlineGlow: '0 0 12px rgba(255,255,255,0.8)',
-  imageUrl: '/site-logo.png',
-  imageGlow: 'drop-shadow(0 0 16px rgba(255,255,255,0.65))',
+  imageUrl: process.env.HERO_IMAGE_URL ||'',
+  imageGlow: 'drop-shadow(0 0 16px rgba(251, 255, 0, 0.65))',
   coinImageUrl: undefined, // NEW
 };
 
