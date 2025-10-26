@@ -27,9 +27,41 @@ const io = new IOServer(server, {
 const PORT = process.env.PORT || 8080;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const INTERVAL_CRON = process.env.AFFILIATE_CRON || '* * * * *';
+
+const INTERVAL_CRON = process.env.AFFILIATE_CRON || '*/30 * * * *';
 
 let leaderboard = [];
+let updatedAt = null;
+
+const CACHE_PATH = path.join(UPLOAD_DIR, 'leaderboard.json');
+
+function saveCache() {
+  try {
+    const tmp = CACHE_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ updatedAt, data: leaderboard }), 'utf8');
+    fs.renameSync(tmp, CACHE_PATH);
+  } catch (e) {
+    console.warn('[cache] save failed:', e?.message || e);
+  }
+}
+
+function loadCacheIfAny() {
+  try {
+    if (!fs.existsSync(CACHE_PATH)) return;
+    const raw = fs.readFileSync(CACHE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.data)) {
+      leaderboard = parsed.data;
+      updatedAt = parsed.updatedAt || new Date().toISOString();
+      console.log(`[cache] loaded ${leaderboard.length} records from disk`);
+    }
+  } catch (e) {
+    console.warn('[cache] load failed:', e?.message || e);
+  }
+}
+loadCacheIfAny();
+
+
 let prizes = [175, 100, 70, 50, 35, 25, 15, 10, 10, 10];
 let countdownEnd = process.env.COUNTDOWN_END
   ? new Date(process.env.COUNTDOWN_END).toISOString()
@@ -39,7 +71,8 @@ let announcement = process.env.ANNOUNCEMENT || '';
 let hero = {
   headline: '$ 500 CSGOWIN WAGER LEADERBOARD',
   sub1: 'Top 10 players with the highest wagers past 2 weeks win a share of $500',
-  sub2: 'The leaderboard updates every minute.',
+
+  sub2: 'The leaderboard updates every 30 minutes.',
   linkText: undefined,
   linkUrl: undefined,
   headlineColor: '#ffffff',
@@ -59,49 +92,58 @@ app.use(
 );
 
 function sortPlayers(list) {
-  return [...list].sort((a, b) => (b.points || 0) - (a.points || 0));
+  return (Array.isArray(list) ? list : [])
+    .map(x => ({ ...x, points: Number(x?.points) || 0 }))
+    .sort((a, b) => b.points - a.points);
+}
+function isSane(list) {
+  return Array.isArray(list) && list.length > 0;
 }
 
 async function refresh() {
-  if (countdownEnd && Date.now() > new Date(countdownEnd).getTime()) {
-    console.log("⛔ Countdown ended — stopping API updates (leaderboard frozen).");
-    return;
-  }
-  const newPlayers = await fetchAffiliate();
-  if (!newPlayers || newPlayers.length === 0) {
-    console.log("⚠️ No data from API — keeping existing leaderboard");
-    return;
-  }
-  const existing = new Map(leaderboard.map(p => [p.id, p]));
-  const now = Date.now();
-  for (const p of newPlayers) {
-    if (existing.has(p.id)) {
-      const old = existing.get(p.id);
-      old.points = p.points;
-      old.name = p.name;
-      old.avatar = p.avatar;
-      old.lastSeen = now;
+  try {
+    const players = await fetchAffiliate();
+    const sorted = sortPlayers(players);
+
+    if (isSane(sorted)) {
+      leaderboard = sorted;
+      updatedAt = new Date().toISOString();
+      saveCache();
+      io.emit('leaderboard:update', leaderboard);
+      console.log(`[refresh] ok: ${leaderboard.length} players at ${updatedAt}`);
     } else {
-      existing.set(p.id, { ...p, lastSeen: now });
+      console.warn('[refresh] empty/invalid list; keeping last good cache');
     }
+  } catch (err) {
+    console.error('[refresh] failed:', err?.message || err);
+  
   }
-
-  leaderboard = Array.from(existing.values()).sort((a, b) => b.points - a.points);
-
-  io.emit('leaderboard:update', leaderboard);
-  console.log(`✅ Leaderboard updated — ${leaderboard.length} players`);
 }
 
 cron.schedule(INTERVAL_CRON, refresh);
-setTimeout(refresh, 1500);
 
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+setTimeout(() => { refresh().catch(()=>{}); }, 1500);
+
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    updatedAt,
+    count: leaderboard.length
+  });
+});
+
 app.get('/api/leaderboard', (req, res) => res.json(leaderboard));
 app.get('/api/countdown', (req, res) => res.json({ end: countdownEnd }));
 app.get('/api/announcement', (req, res) => res.json({ announcement }));
 app.get('/api/prizes', (req, res) => res.json({ prizes }));
 app.get('/api/hero', (req, res) => res.json(hero));
 
+// Optional: metadata endpoint if you want it in the frontend later
+app.get('/api/leaderboard/meta', (req, res) => {
+  res.json({ updatedAt, count: leaderboard.length });
+});
+
+// ------------------ Admin helpers ------------------
 function requireAdmin(req, res, next) {
   const token = req.get('x-admin-token');
   if (!process.env.ADMIN_TOKEN) return res.status(404).json({ error: 'not_found' });
@@ -125,15 +167,20 @@ app.post('/api/prizes', requireAdmin, (req, res) => {
 });
 
 app.post('/api/countdown', requireAdmin, (req, res) => {
-  const raw = req.body?.end;
-  let t = Number.isFinite(raw) ? Number(raw) : Date.parse(raw || '');
-  if (!t && typeof raw === 'string') {
-    const local = raw.replace(' ', 'T');
-    t = Date.parse(local);
+  let t = req.body?.end;
+  if (typeof t === 'string' && /^\d+$/.test(t)) t = Number(t);
+  if (typeof t === 'number') t = new Date(t);
+  if (typeof t === 'string') {
+    // allow "YYYY-MM-DD HH:mm:ss" without timezone
+    const raw = t.trim();
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+      t = new Date(raw.replace(' ', 'T'));
+    }
   }
-  if (!t) return res.status(400).json({ error: 'invalid end' });
+  const dt = t instanceof Date ? t.getTime() : Date.parse(String(t || ''));
+  if (!Number.isFinite(dt)) return res.status(400).json({ error: 'invalid end' });
 
-  countdownEnd = new Date(t).toISOString();
+  countdownEnd = new Date(dt).toISOString();
   io.emit('countdown:update', { end: countdownEnd });
   res.json({ end: countdownEnd });
 });
@@ -144,6 +191,7 @@ app.post('/api/hero/image', requireAdmin, upload.single('image'), (req, res) => 
   const finalPath = path.join(UPLOAD_DIR, 'hero' + path.extname(req.file.originalname || '.png'));
   fs.renameSync(req.file.path, finalPath);
 
+  // public URL
   const publicUrl = '/uploads/' + path.basename(finalPath);
   hero.imageUrl = publicUrl;
   io.emit('hero:update', hero);
@@ -159,7 +207,8 @@ app.post('/api/announcement', requireAdmin, (req, res) => {
 
 app.post('/api/hero', requireAdmin, (req, res) => {
   const {
-    headline, sub1, sub2, linkText, linkUrl,
+    headline, sub1, sub2,
+    linkText, linkUrl,
     headlineColor, sub1Color, sub2Color,
     headlineGlow, imageUrl, imageGlow
   } = req.body || {};
@@ -184,10 +233,10 @@ app.post('/api/hero', requireAdmin, (req, res) => {
 
 app.post('/api/admin/refresh', requireAdmin, async (req, res) => {
   await refresh();
-  res.json({ ok: true, count: leaderboard.length });
+  res.json({ ok: true, count: leaderboard.length, updatedAt });
 });
 
-
+// -------- IDs export helper (unchanged except filename fix) --------
 app.get('/api/ids', requireAdmin, async (req, res) => {
   try {
     const raw = await fetchAffiliateRaw();
@@ -204,15 +253,13 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
             break;
           }
         }
-        if (cur != null && cur !== '') return cur;
+        if (cur != null) return cur;
       }
       return undefined;
     };
 
-    const BASE64 = 76561197960265728n; 
-
+    const BASE64 = 76561197960265728n;
     function toSteam64({ steam64, steam2, steam3, accountId }) {
-    
       if (steam64 != null) {
         const s = String(steam64).trim();
         if (/^\d{17}$/.test(s)) return s;
@@ -221,18 +268,16 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
           if (n >= BASE64) return n.toString();
         } catch {}
       }
-
       if (steam2) {
         const s = String(steam2).trim();
         const m = /^STEAM_[0-5]:([01]):(\d+)$/.exec(s);
         if (m) {
-          const y = BigInt(m[1]);
-          const z = BigInt(m[2]);
-          const acct = z * 2n + y;
-          return (BASE64 + acct).toString();
+          const acct = BigInt(m[2]);
+          const universe = BigInt(m[1]);
+          // universe is not needed for accountId → 64 conversion here
+          return (BASE64 + acct * 2n + (universe === 1n ? 1n : 0n)).toString();
         }
       }
-
       if (steam3) {
         const s = String(steam3).trim();
         const m = /^\[U:1:(\d+)\]$/.exec(s);
@@ -241,20 +286,16 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
           return (BASE64 + acct).toString();
         }
       }
-
       if (accountId != null && String(accountId).trim() !== '') {
         try {
           const a = BigInt(String(accountId).trim());
-          if (a >= BASE64) return a.toString(); 
           return (BASE64 + a).toString();
         } catch {}
       }
-
       return '';
     }
 
     const mapped = list.map((u, i) => {
- 
       const name = pick(
         u,
         'name','username','displayName',
@@ -291,8 +332,11 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       );
       const accountId = pick(
         u,
-        'account_id','steam_account_id',
-        'user.account_id','profile.account_id','steam.account_id'
+        'accountId','account_id',
+        'user.accountId','user.account_id',
+        'profile.accountId','profile.account_id',
+        'steam.accountId','steam.account_id',
+        'profile.account_id','steam.account_id'
       );
 
       const steam64 = toSteam64({ steam64: steam64Raw, steam2, steam3, accountId });
@@ -308,7 +352,7 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
     const seen = new Set();
     const unique = [];
     for (const r of mapped) {
-      const k = r.id || '';
+      const k = `${r.id}|${r.uuid}|${r.steam64}`;
       if (seen.has(k)) continue;
       seen.add(k);
       unique.push(r);
@@ -317,15 +361,15 @@ app.get('/api/ids', requireAdmin, async (req, res) => {
       `name: ${r.name} | id: ${r.id} | uuid: ${r.uuid} | 64id: ${r.steam64}`
     );
     const text = lines.join('\n');
-    
+
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="tokyorewards-ids_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.txt"`);
+    const fname = `ids-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.txt`;
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
     res.send(text);
   } catch (e) {
     console.error('ids export error:', e);
     res.status(500).json({ error: 'ids_export_failed' });
   }
 });
-
 
 server.listen(PORT, '0.0.0.0', () => console.log(`listening on ${PORT}`));
