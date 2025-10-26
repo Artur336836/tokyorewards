@@ -80,6 +80,7 @@ let hero = {
   sub2Color: '#cbd5e1',
   headlineGlow: '0 0 12px rgba(255,255,255,0.8)',
   imageUrl: '/site-logo.png',
+  imageScale: 1.0,
   imageGlow: 'drop-shadow(0 0 16px rgba(255,255,255,0.65))'
 };
 
@@ -210,7 +211,8 @@ app.post('/api/hero', requireAdmin, (req, res) => {
     headline, sub1, sub2,
     linkText, linkUrl,
     headlineColor, sub1Color, sub2Color,
-    headlineGlow, imageUrl, imageGlow
+    headlineGlow, imageUrl, imageGlow, 
+    imageScale
   } = req.body || {};
 
   hero = {
@@ -224,7 +226,8 @@ app.post('/api/hero', requireAdmin, (req, res) => {
     sub2Color: sub2Color ?? hero.sub2Color,
     headlineGlow: headlineGlow ?? hero.headlineGlow,
     imageUrl: imageUrl ?? hero.imageUrl,
-    imageGlow: imageGlow ?? hero.imageGlow
+    imageGlow: imageGlow ?? hero.imageGlow,
+    imageScale: typeof imageScale === 'number' ? imageScale : hero.imageScale,
   };
 
   io.emit('hero:update', hero);
