@@ -126,36 +126,47 @@ function computeWindowed(startMs, endMs) {
   const hist = readHistory();
   if (!hist.length) return [];
 
-  const before = new Map();   // id -> last value before start
-  const inwin  = new Map();   // id -> max value during window
-
+  const before = new Map();       
+  const firstIn = new Map();      
+  const maxIn   = new Map();      
   for (const snap of hist) {
-    const t = snap.ts, P = snap.p || {};
+    const t = snap.ts;
+    const P = snap.p || {};
     if (t < startMs) {
+      // track last value before start
       for (const [id, pts] of Object.entries(P)) before.set(id, pts);
     } else if (t <= endMs) {
+      // inside window
       for (const [id, pts] of Object.entries(P)) {
-        const cur = inwin.get(id);
-        if (cur == null || pts > cur) inwin.set(id, pts);
+        if (!firstIn.has(id)) firstIn.set(id, pts);          // first seen at/after start
+        const cur = maxIn.get(id);
+        if (cur == null || pts > cur) maxIn.set(id, pts);    // peak in window
       }
     }
   }
 
   const results = [];
-  const ids = new Set([...before.keys(), ...inwin.keys()]);
+  const ids = new Set([...before.keys(), ...firstIn.keys(), ...maxIn.keys()]);
   for (const id of ids) {
-    const baseline = before.get(id) ?? 0;
-    const peak = inwin.get(id);
-    if (peak == null) continue;
+    const baseline = before.has(id) ? before.get(id) : (firstIn.get(id) ?? 0);
+    const peak = maxIn.get(id);
+    if (peak == null) continue; // never seen inside window
     const gain = Math.max(0, peak - baseline);
     if (gain > 0) {
       const cur = (leaderboard || []).find(u => String(u.id) === id);
-      results.push({ id, name: cur?.name ?? 'Player', avatar: cur?.avatar ?? null, points: gain });
+      results.push({
+        id,
+        name: cur?.name ?? 'Player',
+        avatar: cur?.avatar ?? null,
+        points: gain
+      });
     }
   }
-  results.sort((a, b) => b.points - a.points);
+
+  results.sort((a,b) => b.points - a.points);
   return results;
 }
+
 
 // ---------- Refresh loop ----------
 async function refresh() {
