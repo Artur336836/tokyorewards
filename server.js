@@ -77,7 +77,7 @@ let countdownEnd = process.env.COUNTDOWN_END ? new Date(process.env.COUNTDOWN_EN
 let announcement = process.env.ANNOUNCEMENT || '';
 let hero = {
   headline: '$ 500 CSGOWIN WAGER LEADERBOARD',
-  sub1: 'Top 10 players with the highest wagers past 2 weeks win a share of $500',
+  sub1: 'Leaderboard ended, to claim the prize open the ticket on discord',
   sub2: 'The leaderboard updates every 30 minutes.',
   linkText: process.env.HERO_LINK_TEXT || '',
   linkUrl: process.env.HERO_LINK_URL || '',
