@@ -1,7 +1,7 @@
-
 import axios from 'axios';
 
-const BASE = process.env.AFFILIATE_API || 'https://api.csgowin.com/api/affiliate/external';
+// Removed the specific API link. Leave it empty until you have your new API.
+const BASE = process.env.AFFILIATE_API || ''; 
 const CODE = process.env.AFFILIATE_CODE || '';
 const APIKEY = process.env.AFFILIATE_API_KEY || '';
 const BY = process.env.AFFILIATE_BY || 'wager';
@@ -16,7 +16,6 @@ function ttlGet(k){const h=cache.get(k);if(!h)return null;if(h.exp<Date.now()){c
 function ttlSet(k,v,ms){cache.set(k,{val:v,exp:Date.now()+ms})}
 function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 
-
 function toPlayers(raw){
   if(!Array.isArray(raw)) return [];
   return raw.map((u,i)=>({
@@ -27,14 +26,26 @@ function toPlayers(raw){
   }));
 }
 
+// Generates fake data for testing so your frontend isn't blank
+function getDummyData() {
+  return [
+    { id: '1', name: 'Hrislit', avatar: null, points: 150000 },
+    { id: '2', name: 'GamerX', avatar: null, points: 120000 },
+    { id: '3', name: 'CryptoKing', avatar: null, points: 90000 },
+    { id: '4', name: 'WhaleSniper', avatar: null, points: 50000 },
+    { id: '5', name: 'LuckyCharm', avatar: null, points: 25000 },
+    { id: '6', name: 'NoobMaster', avatar: null, points: 10000 }
+  ];
+}
 
 export async function fetchAffiliateRaw() {
+  // Use dummy data if API isn't set up yet
+  if (!BASE || !APIKEY || !CODE) return getDummyData(); 
+
   const lt = String(Date.now());
   const qs = new URLSearchParams({ code: CODE, gt: GT, lt, by: BY, sort: SORT, take: TAKE, skip: SKIP }).toString();
   const url = `${BASE}?${qs}`;
   const cached = ttlGet(url + ':raw'); if (cached) return cached;
-
-  if (!APIKEY || !CODE) return [];
 
   for (let a = 0; a < 5; a++) {
     try {
@@ -63,12 +74,13 @@ export async function fetchAffiliateRaw() {
 }
 
 export async function fetchAffiliate() {
+  // Use dummy data if API isn't set up yet
+  if (!BASE || !APIKEY || !CODE) return getDummyData(); 
+
   const lt = String(Date.now());
   const qs = new URLSearchParams({ code: CODE, gt: GT, lt, by: BY, sort: SORT, take: TAKE, skip: SKIP }).toString();
   const url = `${BASE}?${qs}`;
   const cached = ttlGet(url + ':players'); if (cached) return cached;
-
-  if (!APIKEY || !CODE) return [];
 
   try {
     const res = await axios.get(url, {
